@@ -1,0 +1,8 @@
+dev/
+node_modules/
+*.log
+.DS_Store
+# make.fun kit (reference material only — never part of the submitted repo)
+github-core-clone-01-kit/
+kit.tar.gz
+/tmp/
