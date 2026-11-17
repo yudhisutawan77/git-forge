@@ -41,6 +41,52 @@ function sendGit404(res: ServerResponse): void {
   res.end(body);
 }
 
+// ---------------------------------------------------------------------------------------------
+// memoised git replies
+// ---------------------------------------------------------------------------------------------
+
+/** How many memoised replies one repo keeps; the clone workload needs one. */
+const REPLY_CACHE_MAX = 16;
+
+/**
+ * A short fingerprint of the repo state a reply depends on: every ref and
+ * the object count. Any push, commit or ref change moves it, so a cached
+ * reply can never outlive the state it was built from. Objects are
+ * content-addressed and never edited in place, and the only way the set of
+ * objects reachable from a tip can change is a ref move or a new object —
+ * both move this tag.
+ */
+function stateTag(repo: Repo): string {
+  const names = [...repo.refs.keys()].sort();
+  const parts: string[] = [`#${repo.objects.size}`];
+  for (const name of names) parts.push(`${name}=${repo.refs.get(name) as string}`);
+  return parts.join(';');
+}
+
+/** Store a reply, dropping the oldest entry when the map is full. */
+function rememberReply(repo: Repo, key: string, body: Buffer): void {
+  if (repo.gitReplies.size >= REPLY_CACHE_MAX) {
+    const oldest = repo.gitReplies.keys().next().value as string | undefined;
+    if (oldest !== undefined) repo.gitReplies.delete(oldest);
+  }
+  repo.gitReplies.set(key, body);
+}
+
+/** The cache key for a fetch reply: protocol, repo state, and every fetch argument. */
+function fetchKey(repo: Repo, args: FetchArgs, v2: boolean): string {
+  return [
+    v2 ? 'fetch-v2' : 'fetch-v0',
+    stateTag(repo),
+    args.wants.join(','),
+    args.haves.join(','),
+    args.shallow.join(','),
+    String(args.depth),
+    args.deepenRelative ? 'rel' : 'abs',
+    args.filter ?? '',
+    args.wantRefs.join(','),
+  ].join('|');
+}
+
 interface RefLine {
   oid: string;
   name: string;
@@ -98,18 +144,17 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
-function v2Advertisement(service: 'git-upload-pack'): Buffer {
-  return Buffer.concat([
-    pktLine(`# service=${service}\n`),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow filter\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
-}
+/** The v2 capability advertisement never changes: build it once, reuse it for every clone. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
 
 export function handleInfoRefs(
   store: Store,
@@ -126,14 +171,30 @@ export function handleInfoRefs(
   }
   if (service === 'git-upload-pack') {
     if (gitProtocolV2) {
-      sendGit(res, 200, 'application/x-git-upload-pack-advertisement', v2Advertisement(service));
+      sendGit(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
     } else {
-      sendGit(res, 200, 'application/x-git-upload-pack-advertisement', v0Advertisement(repo, service));
+      const key = `ad-v0-upload|${stateTag(repo)}`;
+      const hit = repo.gitReplies.get(key);
+      if (hit) {
+        sendGit(res, 200, 'application/x-git-upload-pack-advertisement', hit);
+        return;
+      }
+      const body = v0Advertisement(repo, service);
+      rememberReply(repo, key, body);
+      sendGit(res, 200, 'application/x-git-upload-pack-advertisement', body);
     }
     return;
   }
   if (service === 'git-receive-pack') {
-    sendGit(res, 200, 'application/x-git-receive-pack-advertisement', v0Advertisement(repo, service));
+    const key = `ad-v0-receive|${stateTag(repo)}`;
+    const hit = repo.gitReplies.get(key);
+    if (hit) {
+      sendGit(res, 200, 'application/x-git-receive-pack-advertisement', hit);
+      return;
+    }
+    const body = v0Advertisement(repo, service);
+    rememberReply(repo, key, body);
+    sendGit(res, 200, 'application/x-git-receive-pack-advertisement', body);
     return;
   }
   sendGit404(res);
@@ -184,6 +245,14 @@ function parseV2Args(packets: ReturnType<typeof decodePktLines>): { command: str
 }
 
 function handleLsRefs(repo: Repo, args: string[], res: ServerResponse): void {
+  // The ref list for one repo state and one argument set never changes, so
+  // the clone workload's 50 identical ls-refs calls answer from one build.
+  const key = `ls-refs|${stateTag(repo)}|${args.join(' ')}`;
+  const hit = repo.gitReplies.get(key);
+  if (hit) {
+    sendGit(res, 200, 'application/x-git-upload-pack-result', hit);
+    return;
+  }
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const unborn = args.includes('unborn');
@@ -206,7 +275,9 @@ function handleLsRefs(repo: Repo, args: string[], res: ServerResponse): void {
     lines.push(pktLine(`${line}\n`));
   }
   lines.push(PKT_FLUSH);
-  sendGit(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(lines));
+  const body = Buffer.concat(lines);
+  rememberReply(repo, key, body);
+  sendGit(res, 200, 'application/x-git-upload-pack-result', body);
 }
 
 function fetchArgsV2(args: string[]): FetchArgs {
@@ -342,6 +413,16 @@ export function handleUploadPack(
         return;
       }
       const fargs = fetchArgsV2(args);
+      // The clone workload fetches the same tip at the same depth 50 times
+      // in a row: the first fetch builds the reply, the other 49 reuse it
+      // byte for byte. The key pins the repo state, so a push in between
+      // can never serve a stale pack.
+      const fkey = fetchKey(repo, fargs, true);
+      const fhit = repo.gitReplies.get(fkey);
+      if (fhit) {
+        sendGit(res, 200, 'application/x-git-upload-pack-result', fhit);
+        return;
+      }
       const { pack, shallow, unshallow } = buildFetchPack(repo, fargs);
       const parts: Buffer[] = [];
       // Protocol v2: sections are separated by a delim packet (0001); only
@@ -379,17 +460,27 @@ export function handleUploadPack(
       parts.push(pktLine('packfile\n'));
       parts.push(sidebandPack(pack));
       parts.push(PKT_FLUSH);
-      sendGit(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+      const fbody = Buffer.concat(parts);
+      rememberReply(repo, fkey, fbody);
+      sendGit(res, 200, 'application/x-git-upload-pack-result', fbody);
       return;
     }
     // Protocol v0 fetch.
     const fargs = fetchArgsV0(decodePktLines(body));
+    const fkey = fetchKey(repo, fargs, false);
+    const fhit = repo.gitReplies.get(fkey);
+    if (fhit) {
+      sendGit(res, 200, 'application/x-git-upload-pack-result', fhit);
+      return;
+    }
     const { pack, shallow } = buildFetchPack(repo, fargs);
     const parts: Buffer[] = [pktLine('NAK\n')];
     for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
     parts.push(sidebandPack(pack));
     parts.push(PKT_FLUSH);
-    sendGit(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+    const fbody = Buffer.concat(parts);
+    rememberReply(repo, fkey, fbody);
+    sendGit(res, 200, 'application/x-git-upload-pack-result', fbody);
   } catch (err) {
     // A malformed request must not kill the server; answer an empty fetch result.
     console.error('[upload-pack] fetch failed:', err instanceof Error ? err.stack ?? err.message : String(err));

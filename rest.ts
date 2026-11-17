@@ -86,8 +86,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function queryOf(req: IncomingMessage): URLSearchParams {
+  // Hot path: most requests carry no query string at all, so skip the URL
+  // object entirely in that case. With a query, parse just the query part.
+  const raw = req.url ?? '';
+  const q = raw.indexOf('?');
+  if (q < 0) return new URLSearchParams();
   try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
+    return new URLSearchParams(raw.slice(q + 1));
   } catch {
     return new URLSearchParams();
   }
@@ -643,11 +648,19 @@ function splitPath(pathname: string): string[] {
 }
 
 export function handleRest(store: Store, req: IncomingMessage, res: ServerResponse, body: Buffer): boolean {
-  let pathname = '/';
-  try {
-    pathname = new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    pathname = '/';
+  // Same fast path as app.ts: the request line is an origin-form path, so
+  // the part before '?' is the pathname — no URL object to build.
+  const rawUrl = req.url ?? '/';
+  let pathname: string;
+  if (rawUrl.startsWith('http://') || rawUrl.startsWith('https://')) {
+    try {
+      pathname = new URL(rawUrl).pathname;
+    } catch {
+      pathname = '/';
+    }
+  } else {
+    const cut = rawUrl.indexOf('?');
+    pathname = cut < 0 ? rawUrl : rawUrl.slice(0, cut);
   }
   if (!pathname.startsWith('/api/v3')) return false;
   const method = req.method ?? 'GET';

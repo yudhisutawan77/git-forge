@@ -662,6 +662,10 @@ export interface Repo {
   nextNumber: number;
   nextCommentId: number;
   seq: number;
+  /** Memoised git-protocol replies (fetch results, ls-refs, advertisements).
+   * Keys embed the repo's state, so an entry can never outlive the state it
+   * was built from; the maps are bounded, oldest entry dropped first. */
+  gitReplies: Map<string, Buffer>;
 }
 
 export interface Store {
@@ -713,6 +717,7 @@ export function createRepoRecord(store: Store, name: string, description: string
     nextNumber: 1,
     nextCommentId: 1,
     seq: store.nextRepoId,
+    gitReplies: new Map<string, Buffer>(),
   };
   store.nextRepoId += 1;
   store.repos.set(repoKey(repo.owner, name), repo);

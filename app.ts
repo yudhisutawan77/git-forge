@@ -12,11 +12,20 @@ import { handleRest, requestId, sendJson } from './rest.ts';
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
 function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+  // Hot path: the request line is an origin-form path (the trial dials the
+  // entry directly, never through a proxy), so the part before '?' is the
+  // pathname — no URL object to build. An absolute-form URL falls back to
+  // the parser, exactly as before.
+  const raw = req.url ?? '/';
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    try {
+      return new URL(raw).pathname;
+    } catch {
+      return '/';
+    }
   }
+  const cut = raw.indexOf('?');
+  return cut < 0 ? raw : raw.slice(0, cut);
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -84,11 +93,22 @@ export function createApp(): Server {
           const name = decodeURIComponent(gitMatch[2] as string);
           const suffix = gitMatch[3] as string;
           if (suffix.startsWith('info/refs')) {
+            // The service comes from the query string; scan it directly
+            // instead of building a URL object for one parameter.
             let service = '';
-            try {
-              service = new URL(req.url ?? '/', 'http://entry').searchParams.get('service') ?? '';
-            } catch {
-              service = '';
+            const raw = req.url ?? '';
+            const q = raw.indexOf('?');
+            if (q >= 0) {
+              for (const pair of raw.slice(q + 1).split('&')) {
+                if (pair.startsWith('service=')) {
+                  try {
+                    service = decodeURIComponent(pair.slice('service='.length));
+                  } catch {
+                    service = '';
+                  }
+                  break;
+                }
+              }
             }
             if (method !== 'GET') {
               sendJson(store, res, 405, { message: 'Method Not Allowed' });
